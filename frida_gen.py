@@ -1,643 +1,445 @@
+#!/usr/bin/env python3
 """
-MO5 — Frida Script Generator
-Hook generation, SSL bypass scripts, root detection bypass, class enumeration.
+M5 — Frida Hook Generator
+
+Generate real Frida JavaScript instrumentation hooks from a JSON specification:
+
+  * Java hooks  — Java.perform { Java.use(...).<method>.implementation = ... }
+  * Native hooks — Interceptor.attach(...) on exported symbols / module bases
+  * Combined   — an on-load script that retrieves a class/the loaded module.
+
+The generator is fully OFFLINE and stdlib-only. No frida device is needed to
+generate or validate; the JS is validated with a built-in structural validator
+(no node required).
+
+WARNING: For authorized device-owner / lab use only. Only hook applications
+you own or have explicit permission to instrument.
+
+Usage:
+    python3 frida_gen.py generate spec.json -o out/
+    python3 frida_gen.py validate script.js
+    python3 frida_gen.py demo                      # offline demo, exits 0
 """
 
+import argparse
 import json
 import os
 import re
 import sys
-from typing import List, Dict, Optional, Any
 
 
-class FridaScript:
-    """Represents a Frida instrumentation script."""
+# ---------------------------------------------------------------------------
+# spec model
+# ---------------------------------------------------------------------------
 
-    def __init__(self, name: str, description: str = ""):
-        self.name = name
-        self.description = description
-        self.hooks: List[Dict[str, str]] = []
-        self.enumerations: List[Dict[str, str]] = []
-        self.exports: List[str] = []
-
-    def add_hook(self, class_name: str, method_name: str, implementation: str,
-                 overload_types: Optional[List[str]] = None) -> None:
-        hook = {
-            "class": class_name,
-            "method": method_name,
-            "implementation": implementation,
+DEFAULT_SPEC = {
+    "package": "com.lab.app",
+    "hooks": [
+        {
+            "type": "java",
+            "class": "com.lab.app.core.AuthManager",
+            "method": "login",
+            "params": ["java.lang.String", "java.lang.String"],
+            "return": "boolean",
+            "on_enter": {
+                "log_args": True,
+                "annotate": "AUTH-LOGIN"
+            }
+        },
+        {
+            "type": "java",
+            "class": "com.lab.app.core.CryptoBox",
+            "method": "decrypt",
+            "params": ["[B"],
+            "return": "[B",
+            "on_exit": {}
+        },
+        {
+            "type": "native",
+            "module": "libnative.so",
+            "symbol": "crypto_box_decrypt",
+            "on_enter": {"log": "NATIVE-CRYPTO enter"}
         }
-        if overload_types:
-            hook["overloads"] = overload_types
-        self.hooks.append(hook)
-
-    def add_enumeration(self, target: str, pattern: str = ".*") -> None:
-        self.enumerations.append({"target": target, "pattern": pattern})
-
-    def add_export(self, function_name: str) -> None:
-        self.exports.append(function_name)
-
-    def to_frida_js(self) -> str:
-        lines = []
-        lines.append("// Auto-generated Frida script")
-        lines.append(f"// {self.description}" if self.description else "")
-        lines.append("")
-
-        for enum_def in self.enumerations:
-            target = enum_def["target"]
-            pattern = enum_def["pattern"]
-            lines.append(f'Java.perform(function() {{')
-            lines.append(f'    var classes = Java.enumerateLoadedClasses();')
-            lines.append(f'    classes.forEach(function(className) {{')
-            lines.append(f'        if (className.match(/{pattern}/)) {{')
-            lines.append(f'            send("[ENUM] " + className);')
-            lines.append(f'        }}')
-            lines.append(f'    }});')
-            lines.append(f'}});')
-            lines.append("")
-
-        for hook in self.hooks:
-            class_name = hook["class"]
-            method = hook["method"]
-            impl = hook["implementation"]
-            overloads = hook.get("overloads")
-
-            lines.append(f'Java.perform(function() {{')
-            lines.append(f'    var targetClass = Java.use("{class_name}");')
-
-            if overloads:
-                for overload in overloads:
-                    lines.append(f'    targetClass.{method}.overload({overload}).implementation = function() {{')
-                    lines.append(f'        {impl}')
-                    lines.append(f'    }};')
-            else:
-                lines.append(f'    targetClass.{method}.implementation = function() {{')
-                lines.append(f'        {impl}')
-                lines.append(f'    }};')
-
-            lines.append(f'}});')
-            lines.append("")
-
-        for export_name in self.exports:
-            lines.append(f'rpc.exports.{export_name} = function() {{')
-            lines.append(f'    // TODO: implement {export_name}')
-            lines.append(f'}};')
-
-        return "\n".join(lines)
-
-    def to_dict(self) -> Dict:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "hooks": self.hooks,
-            "enumerations": self.enumerations,
-            "exports": self.exports,
-        }
-
-    def save(self, output_path: str) -> bool:
-        try:
-            with open(output_path, "w") as f:
-                f.write(self.to_frida_js())
-            return True
-        except IOError:
-            return False
-
-    def save_json(self, output_path: str) -> bool:
-        try:
-            with open(output_path, "w") as f:
-                json.dump(self.to_dict(), f, indent=2)
-            return True
-        except IOError:
-            return False
+    ]
+}
 
 
-class SSLBypassGenerator:
-    """Generate Frida scripts for SSL pinning bypass."""
+class SpecError(Exception):
+    pass
 
-    @staticmethod
-    def bypass_okhttp3() -> str:
-        return '''Java.perform(function() {
-    var TrustManagerImpl = Java.use("com.android.org.conscrypt.TrustManagerImpl");
-    TrustManagerImpl.verifyChain.implementation = function(untrustedChain, trustAnchorChain, host, clientAuth, ocspData, tlsSctData) {
-        send("[SSL] Bypassing certificate verification for: " + host);
-        return untrustedChain;
-    };
-});'''
 
-    @staticmethod
-    def bypass_webview() -> str:
-        return '''Java.perform(function() {
-    var WebViewClient = Java.use("android.webkit.WebViewClient");
-    WebViewClient.onReceivedSslError.implementation = function(view, handler, error) {
-        send("[SSL] Bypassing WebView SSL error");
-        handler.proceed();
-    };
-});'''
+def validate_spec(spec):
+    """Structural validation of the hook spec dict. Returns list of errors."""
+    errors = []
+    if not isinstance(spec, dict):
+        return ["spec must be a JSON object"]
+    if not isinstance(spec.get("package"), str):
+        errors.append("'package' must be a string")
+    hooks = spec.get("hooks")
+    if not isinstance(hooks, list) or not hooks:
+        errors.append("'hooks' must be a non-empty array")
+        return errors
+    for i, h in enumerate(hooks):
+        if not isinstance(h, dict):
+            errors.append("hooks[%d] must be an object" % i)
+            continue
+        t = h.get("type")
+        if t not in ("java", "native"):
+            errors.append("hooks[%d].type must be 'java' or 'native' (got %r)"
+                          % (i, t))
+        if t == "java":
+            if not isinstance(h.get("class"), str) or not h["class"]:
+                errors.append("hooks[%d].class required for java hook" % i)
+            if not isinstance(h.get("method"), str) or not h["method"]:
+                errors.append("hooks[%d].method required for java hook" % i)
+            params = h.get("params")
+            if params is not None and not isinstance(params, list):
+                errors.append("hooks[%d].params must be a list" % i)
+        elif t == "native":
+            if not isinstance(h.get("module"), str) or not h["module"]:
+                errors.append("hooks[%d].module required for native hook" % i)
+            if not isinstance(h.get("symbol"), str) or not h["symbol"]:
+                errors.append("hooks[%d].symbol required for native hook" % i)
+    return errors
 
-    @staticmethod
-    def bypass_hostname_verifier() -> str:
-        return '''Java.perform(function() {
-    var HostnameVerifier = Java.use("javax.net.ssl.HttpsURLConnection");
-    HostnameVerifier.setDefaultHostnameVerifier.implementation = function(verifier) {
-        send("[SSL] Replacing hostname verifier");
-        return Java.use("javax.net.ssl.HostnameVerifier").$new;
-    };
 
-    try {
-        var OkHostnameVerifier = Java.use("okhttp3.internal.tls.OkHostnameVerifier");
-        OkHostnameVerifier.verify.overload("java.lang.String", "java.security.cert.X509Certificate").implementation = function() {
-            send("[SSL] Bypassing OkHttp hostname verification");
-            return true;
-        };
-    } catch(e) {}
-});'''
+# ---------------------------------------------------------------------------
+# JS generation
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def bypass_trust_manager() -> str:
-        return '''Java.perform(function() {
-    var X509TrustManager = Java.use("javax.net.ssl.X509TrustManager");
-    var SSLContext = Java.use("javax.net.ssl.SSLContext");
+JS_TEMPLATE = """\
+/* Auto-generated by m5-frida-gen — authorized lab instrumentation */
+'use strict';
 
-    var TrustManager = Java.registerClass({
-        name: "com.frida.TrustManager",
-        implements: [X509TrustManager],
-        methods: {
-            checkClientTrusted: function(chain, authType) {},
-            checkServerTrusted: function(chain, authType) {
-                send("[SSL] Trusting server certificate");
-            },
-            getAcceptedIssuers: function() { return []; }
-        }
+var PKG = "%(package)s";
+
+function logEvent(tag, msg) {
+  if (typeof send === 'function') {
+    send({ tag: tag, message: String(msg) });
+  } else {
+    console.log('[' + tag + '] ' + String(msg));
+  }
+}
+
+%(java_body)s
+
+%(native_body)s
+
+function main() {
+  if (typeof Java !== 'undefined' && Java.available) {
+    Java.perform(function () {
+      %(java_init)s
     });
+  }
+  if (typeof Module !== 'undefined' && typeof Interceptor !== 'undefined') {
+    %(native_init)s
+  }
+  logEvent('init', 'hooks installed for ' + PKG);
+}
 
-    var TrustManagers = [TrustManager.$new()];
-    var ctx = SSLContext.getInstance("TLS");
-    ctx.init(null, TrustManagers, null);
-    SSLContext.init.overload("[Ljavax.net.ssl.KeyManager;", "[Ljavax.net.ssl.TrustManager;", "java.security.SecureRandom").implementation = function(km, tm, sr) {
-        send("[SSL] Replacing SSLContext TrustManagers");
-        this.init(km, TrustManagers, sr);
-    };
-});'''
-
-    @staticmethod
-    def bypass_network_security_config() -> str:
-        return '''Java.perform(function() {
-    var NetworkSecurityTrustManager = Java.use("android.security.net.config.NetworkSecurityTrustManager");
-    NetworkSecurityTrustManager.checkServerTrusted.overload("[Ljava.security.cert.X509Certificate;", "java.lang.String").implementation = function(chain, authType) {
-        send("[SSL] Bypassing NetworkSecurityConfig trust");
-    };
-});'''
-
-    @staticmethod
-    def generate_all_bypasses() -> str:
-        bypasses = [
-            SSLBypassGenerator.bypass_okhttp3(),
-            SSLBypassGenerator.bypass_webview(),
-            SSLBypassGenerator.bypass_hostname_verifier(),
-            SSLBypassGenerator.bypass_trust_manager(),
-            SSLBypassGenerator.bypass_network_security_config(),
-        ]
-        header = "// Combined SSL Pinning Bypass Script\n// WARNING: For authorized testing only\n\n"
-        return header + "\n\n".join(bypasses)
+main();
+"""
 
 
-class RootDetectionBypassGenerator:
-    """Generate Frida scripts for root detection bypass."""
-
-    @staticmethod
-    def bypass_file_checks() -> str:
-        paths = [
-            "/system/app/Superuser.apk",
-            "/system/xbin/su",
-            "/system/bin/su",
-            "/sbin/su",
-            "/data/local/xbin/su",
-            "/data/local/bin/su",
-            "/system/sd/xbin/su",
-            "/su/bin/su",
-        ]
-        checks = "\n".join(
-            f'                if (path.indexOf("{p}") !== -1) {{ return false; }}'
-            for p in paths
-        )
-        return f'''Java.perform(function() {{
-    var File = Java.use("java.io.File");
-    File.exists.implementation = function() {{
-        var path = this.getAbsolutePath();
-{checks}
-        return this.exists();
-    }};
-}});'''
-
-    @staticmethod
-    def bypass_process_checks() -> str:
-        return '''Java.perform(function() {
-    var Runtime = Java.use("java.lang.Runtime");
-    Runtime.exec.overload("java.lang.String").implementation = function(cmd) {
-        if (cmd.indexOf("su") !== -1) {
-            send("[ROOT] Blocking su exec: " + cmd);
-            throw Java.use("java.io.IOException").$new("Permission denied");
-        }
-        return this.exec(cmd);
-    };
-
-    Runtime.exec.overload("[Ljava.lang.String;").implementation = function(cmdArray) {
-        var cmd = cmdArray.join(" ");
-        if (cmd.indexOf("su") !== -1) {
-            send("[ROOT] Blocking su exec: " + cmd);
-            throw Java.use("java.io.IOException").$new("Permission denied");
-        }
-        return this.exec(cmdArray);
-    };
-});'''
-
-    @staticmethod
-    def bypass_package_checks() -> str:
-        packages = [
-            "com.topjohnwu.magisk",
-            "eu.chainfire.supersu",
-            "com.koushikdutta.superuser",
-            "com.noshufou.android.su",
-        ]
-        checks = "\n".join(
-            f'                if (pkg.indexOf("{p}") !== -1) {{ return false; }}'
-            for p in packages
-        )
-        return f'''Java.perform(function() {{
-    var PackageManager = Java.use("android.app.ApplicationPackageManager");
-    PackageManager.getPackageInfo.overload("java.lang.String", "int").implementation = function(pkg, flags) {{
-{checks}
-        return this.getPackageInfo(pkg, flags);
-    }};
-}});'''
-
-    @staticmethod
-    def bypass_binary_checks() -> str:
-        return '''Java.perform(function() {
-    var File = Java.use("java.io.File");
-    File.canExecute.implementation = function() {
-        var path = this.getAbsolutePath();
-        if (path.indexOf("su") !== -1) {
-            send("[ROOT] Blocking canExecute for: " + path);
-            return false;
-        }
-        return this.canExecute();
-    };
-
-    File.canWrite.implementation = function() {
-        var path = this.getAbsolutePath();
-        if (path.indexOf("/system") !== -1 && path.indexOf("su") !== -1) {
-            return false;
-        }
-        return this.canWrite();
-    };
-});'''
-
-    @staticmethod
-    def generate_all_bypasses() -> str:
-        bypasses = [
-            RootDetectionBypassGenerator.bypass_file_checks(),
-            RootDetectionBypassGenerator.bypass_process_checks(),
-            RootDetectionBypassGenerator.bypass_package_checks(),
-            RootDetectionBypassGenerator.bypass_binary_checks(),
-        ]
-        header = "// Combined Root Detection Bypass Script\n// WARNING: For authorized testing only\n\n"
-        return header + "\n\n".join(bypasses)
+def _js_string(value):
+    """Literal double-quoted JS string from a python value."""
+    s = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % s
 
 
-class ClassEnumerator:
-    """Generate Frida scripts for class and method enumeration."""
+def gen_java_hook(h, idx):
+    """Produce a JS statement block that overrides a Java method."""
+    cls = h["class"]
+    method = h["method"]
+    params = h.get("params") or []
+    params = ["'%s'" % p for p in params] if params else []
+    arglist = ", ".join(params)
+    on_enter = h.get("on_enter") or {}
+    on_exit = h.get("on_exit") or {}
 
-    @staticmethod
-    def enumerate_classes(pattern: str = ".*") -> str:
-        return f'''Java.perform(function() {{
-    Java.enumerateLoadedClasses({{
-        onMatch: function(className) {{
-            if (className.match(/{pattern}/)) {{
-                send("[CLASS] " + className);
-            }}
-        }},
-        onComplete: function() {{
-            send("[ENUM] Class enumeration complete");
-        }}
-    }});
-}});'''
+    # overload selection when parameters are specified
+    overload_call = ""
+    if arglist:
+        overload_call = ".overload(%s)" % arglist
 
-    @staticmethod
-    def enumerate_methods(class_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    var methods = cls.class.getDeclaredMethods();
-    methods.forEach(function(method) {{
-        send("[METHOD] {class_name}." + method.getName() + " " + method.toString());
-    }});
-}});'''
+    log_enter = ""
+    if on_enter.get("log_args"):
+        tag = on_enter.get("annotate") or ("HOOK-%d" % idx)
+        args_join = "Array.prototype.slice.call(arguments).join(', ')"
+        log_enter = ("      logEvent(%s, 'enter args: ' + (%s));"
+                     % (_js_string(tag), args_join))
 
-    @staticmethod
-    def enumerate_fields(class_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    var fields = cls.class.getDeclaredFields();
-    fields.forEach(function(field) {{
-        send("[FIELD] {class_name}." + field.getName() + " : " + field.getType().getName());
-    }});
-}});'''
+    ret_log = ""
+    if "return" in on_exit:
+        tag = on_exit.get("annotate") or ("HOOK-%d" % idx)
+        ret_log = ("      logEvent(%s, String(this.returnValue));"
+                   % (_js_string(tag)))
 
-    @staticmethod
-    def enumerate_constructors(class_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    var constructors = cls.class.getDeclaredConstructors();
-    constructors.forEach(function(ctor) {{
-        send("[CTOR] {class_name}" + ctor.toString());
-    }});
-}});'''
-
-    @staticmethod
-    def enumerate_interfaces(class_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    var interfaces = cls.class.getInterfaces();
-    interfaces.forEach(function(iface) {{
-        send("[IFACE] {class_name} implements " + iface.getName());
-    }});
-}});'''
-
-    @staticmethod
-    def full_class_dump(class_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-
-    send("=== Constructors ===");
-    cls.class.getDeclaredConstructors().forEach(function(c) {{
-        send("  " + c.toString());
-    }});
-
-    send("=== Fields ===");
-    cls.class.getDeclaredFields().forEach(function(f) {{
-        send("  " + f.getType().getName() + " " + f.getName());
-    }});
-
-    send("=== Methods ===");
-    cls.class.getDeclaredMethods().forEach(function(m) {{
-        send("  " + m.getReturnType().getName() + " " + m.getName() + "(" + m.getParameterTypes().map(function(p) {{ return p.getName(); }}).join(", ") + ")");
-    }});
-
-    send("=== Interfaces ===");
-    cls.class.getInterfaces().forEach(function(i) {{
-        send("  " + i.getName());
-    }});
-
-    send("=== Superclass ===");
-    send("  " + cls.class.getSuperclass().getName());
-}});'''
+    sig = "%s.%s%s" % (cls, method, overload_call)
+    block = ("    var inst = Java.use(%s);\n"
+             "    if (inst) {\n"
+             "      var target = inst.%s%s;\n"
+             "      if (typeof target === 'function') {\n"
+             "        target.implementation = function () {\n"
+             "%s"
+             "          var ret = this.%s.apply(this, arguments);\n"
+             "%s"
+             "          return ret;\n"
+             "        };\n"
+             "      } else {\n"
+             "        logEvent(%s, 'method not found: ' + %s);\n"
+             "      }\n"
+             "    } else {\n"
+             "      logEvent(%s, 'class not found: ' + %s);\n"
+             "    }"
+             % (_js_string(cls), method, overload_call, log_enter, method,
+                ret_log, _js_string("hook-miss"),
+                _js_string("%s.%s" % (cls, method)),
+                _js_string("hook-miss"), _js_string(cls))
+             )
+    return block, sig
 
 
-class HookGenerator:
-    """Generate custom Frida hooks from specifications."""
+def gen_native_hook(h, idx):
+    module = h["module"]
+    symbol = h["symbol"]
+    on_enter = h.get("on_enter") or {}
+    on_exit = h.get("on_exit") or {}
 
-    @staticmethod
-    def generate_constructor_hook(class_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    cls.$init.overloads.forEach(function(overload) {{
-        overload.implementation = function() {{
-            send("[CTOR] {class_name}.$init(" + Array.from(arguments).join(", ") + ")");
-            return this.$init.apply(this, arguments);
-        }};
-    }});
-}});'''
+    enter_log = ""
+    if on_enter.get("log"):
+        enter_log = ("      logEvent(%s, 'enter: ' + %s);\n"
+                     % (_js_string(on_enter["log"]), _js_string(symbol)))
 
-    @staticmethod
-    def generate_return_value_hook(class_name: str, method_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    cls.{method_name}.implementation = function() {{
-        var result = this.{method_name}.apply(this, arguments);
-        send("[HOOK] {class_name}.{method_name}() returned: " + result);
-        return result;
-    }};
-}});'''
+    exit_log = ""
+    if on_exit.get("log_return"):
+        exit_log = ("      logEvent(%s, 'exit: ' + retval);\n"
+                    % (_js_string(on_exit["log_return"])))
 
-    @staticmethod
-    def generate_args_hook(class_name: str, method_name: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    cls.{method_name}.implementation = function() {{
-        var args = Array.from(arguments);
-        send("[HOOK] {class_name}.{method_name}(" + args.join(", ") + ")");
-        return this.{method_name}.apply(this, arguments);
-    }};
-}});'''
-
-    @staticmethod
-    def generate_modifying_hook(class_name: str, method_name: str,
-                                arg_index: int, new_value: Any) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    cls.{method_name}.overload("java.lang.String").implementation = function(arg) {{
-        var original = arg;
-        arg = "{new_value}";
-        send("[MODIFY] {class_name}.{method_name}: " + original + " -> " + arg);
-        return this.{method_name}(arg);
-    }};
-}});'''
-
-    @staticmethod
-    def generate_logging_hook(class_name: str, method_name: str,
-                              log_file: str) -> str:
-        return f'''Java.perform(function() {{
-    var cls = Java.use("{class_name}");
-    cls.{method_name}.implementation = function() {{
-        var args = Array.from(arguments);
-        var logEntry = {{
-            timestamp: Date.now(),
-            class: "{class_name}",
-            method: "{method_name}",
-            args: args
-        }};
-        send(JSON.stringify(logEntry));
-        return this.{method_name}.apply(this, arguments);
-    }};
-}});'''
+    block = ("    var base = Module.findBaseAddress(%s);\n"
+             "    if (base) {\n"
+             "      var addr = Module.findExportByName(%s, %s);\n"
+             "      if (addr) {\n"
+             "        Interceptor.attach(addr, {\n"
+             "          onEnter: function (args) {\n"
+             "%s"
+             "          },\n"
+             "          onLeave: function (retval) {\n"
+             "%s"
+             "          }\n"
+             "        });\n"
+             "      } else {\n"
+             "        logEvent('hook-miss', 'export not found: ' + %s);\n"
+             "      }\n"
+             "    }"
+             % (_js_string(module), _js_string(symbol), _js_string(symbol),
+                enter_log, exit_log, _js_string(symbol))
+             )
+    return block
 
 
-class ScriptBuilder:
-    """Build composite Frida scripts from multiple components."""
+def generate(spec, package=None):
+    errors = validate_spec(spec)
+    if errors:
+        raise SpecError("; ".join(errors))
+    pkg = package or spec.get("package") or "com.lab.app"
 
-    def __init__(self, name: str = "custom_script"):
-        self.name = name
-        self.components: List[str] = []
+    java_blocks, native_blocks = [], []
+    java_sigs = []
+    for i, h in enumerate(spec["hooks"]):
+        if h["type"] == "java":
+            block, sig = gen_java_hook(h, i)
+            java_blocks.append(block)
+            java_sigs.append(sig)
+        else:
+            native_blocks.append(gen_native_hook(h, i))
 
-    def add_ssl_bypass(self) -> None:
-        self.components.append(SSLBypassGenerator.generate_all_bypasses())
+    java_init = "\n      ".join(";".join(
+        "try { " + b.replace("\n", " ").strip() + " } catch (e) { "
+        "logEvent('java-error', e); }" for b in java_blocks)) if java_blocks \
+        else "logEvent('init', 'no java hooks');"
 
-    def add_root_bypass(self) -> None:
-        self.components.append(RootDetectionBypassGenerator.generate_all_bypasses())
+    native_init = "\n      ".join(";".join(
+        "try { " + b.replace("\n", " ").strip() + " } catch (e2) { "
+        "logEvent('native-error', e2); }" for b in native_blocks)) \
+        if native_blocks else "logEvent('init', 'no native hooks');"
 
-    def add_class_enum(self, pattern: str = ".*") -> None:
-        self.components.append(ClassEnumerator.enumerate_classes(pattern))
+    script = JS_TEMPLATE % {
+        "package": pkg,
+        "java_body": "\n\n".join(java_blocks),
+        "native_body": "\n\n".join(native_blocks),
+        "java_init": java_init,
+        "native_init": native_init,
+    }
+    return script, {"java_signatures": java_sigs}
 
-    def add_constructor_hook(self, class_name: str) -> None:
-        self.components.append(HookGenerator.generate_constructor_hook(class_name))
 
-    def add_return_hook(self, class_name: str, method: str) -> None:
-        self.components.append(HookGenerator.generate_return_value_hook(class_name, method))
+# ---------------------------------------------------------------------------
+# offline JS structural validator (no node required)
+# ---------------------------------------------------------------------------
 
-    def add_args_hook(self, class_name: str, method: str) -> None:
-        self.components.append(HookGenerator.generate_args_hook(class_name, method))
+# simple delimiters that must be balanced; these are disjoint in the
+# generated code (strings are double-quoted and do not contain { }).
+_OPENS = {"(": ")", "[": "]", "{": "}"}
+_PAIRS = {"(": ")", "[": "]", "{": "}"}
 
-    def add_class_dump(self, class_name: str) -> None:
-        self.components.append(ClassEnumerator.full_class_dump(class_name))
 
-    def build(self) -> str:
-        header = f'// Composite Frida Script: {self.name}\n// Auto-generated by Frida Script Generator\n\n'
-        return header + "\n\n".join(self.components)
+def validate_js(src):
+    """Structural validation: balanced (), [], {} outside of single- or
+    double-quoted strings and line/block comments. Returns (ok, error_or_None)."""
+    stack = []
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c == '"' or c == "'":           # string literal
+            quote = c
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                    continue
+                if src[i] == quote:
+                    break
+                i += 1
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":   # line comment
+            i = src.find("\n", i)
+            if i == -1:
+                break
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":   # block comment
+            j = src.find("*/", i + 2)
+            if j == -1:
+                return False, "unterminated block comment"
+            i = j + 2
+            continue
+        if c in _OPENS:
+            stack.append(c)
+        elif c in _PAIRS.values():
+            if not stack:
+                return False, "unbalanced closing '%s' at offset %d" % (c, i)
+            if _PAIRS[stack[-1]] != c:
+                return False, "mismatched '%s' (expected %s) at offset %d" % (
+                    c, _PAIRS[stack[-1]], i)
+            stack.pop()
+        i += 1
+    if stack:
+        return False, "unbalanced opening '%s'" % _PAIRS[stack[-1]]
+    return True, None
 
-    def save(self, output_path: str) -> bool:
+
+# ---------------------------------------------------------------------------
+# declarative analysis / validation niceties
+# ---------------------------------------------------------------------------
+
+
+def print_generated(script, info, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    script_path = os.path.join(out_dir, "script.js")
+    with open(script_path, "w") as f:
+        f.write(script)
+    info_path = os.path.join(out_dir, "metadata.json")
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+    return script_path, info_path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def demo():
+    print("=" * 66)
+    print("  M5 - Frida Hook Generator - offline demo")
+    print("=" * 66)
+    script, info = generate(DEFAULT_SPEC)
+    ok, err = validate_js(script)
+    print("  Generated script (%d bytes)" % len(script))
+    print("  Java hooks: %d  Native hooks: %d"
+          % (len(info["java_signatures"]),
+             script.count("Interceptor.attach")))
+    print("  JS structural validation: %s" % ("OK" if ok else "FAIL: " + str(err)))
+    print("  Java signatures:")
+    for s in info["java_signatures"]:
+        print("    - %s" % s)
+    print("  Native hooks:")
+    for line in script.splitlines():
+        if "Interceptor.attach" in line:
+            print("    - " + line.strip()[:60])
+    print("exit=0")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="frida_gen.py",
+        description="M5 - Frida Hook Generator (JSON spec -> real Java + "
+                    "native hooks; offline JS validator)")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_gen = sub.add_parser("generate", help="generate script.js from a spec")
+    p_gen.add_argument("spec", help="path to JSON hook spec")
+    p_gen.add_argument("-o", "--output", default=None,
+                       help="output dir (default reports/)")
+    p_gen.add_argument("--validate", action="store_true",
+                       help="run structural JS validation after generation")
+
+    p_val = sub.add_parser("validate", help="validate a JS file structurally")
+    p_val.add_argument("script", help="path to JS file")
+
+    p_demo = sub.add_parser("demo", help="offline demo (exits 0)")
+    args = parser.parse_args(argv)
+
+    if args.cmd == "demo":
+        return demo()
+
+    if args.cmd == "validate":
+        if not os.path.exists(args.script):
+            print("Error: file not found: %s" % args.script)
+            return 1
+        with open(args.script) as f:
+            src = f.read()
+        ok, err = validate_js(src)
+        print("JS structural validation: %s" % ("OK" if ok else "FAIL"))
+        if not ok:
+            print("  error: %s" % err)
+            return 1
+        return 0
+
+    if args.cmd == "generate":
+        if not os.path.exists(args.spec):
+            print("Error: spec not found: %s" % args.spec)
+            return 1
         try:
-            with open(output_path, "w") as f:
-                f.write(self.build())
-            return True
-        except IOError:
-            return False
+            with open(args.spec) as f:
+                spec = json.load(f)
+            script, info = generate(spec)
+        except SpecError as e:
+            print("Spec error: %s" % e)
+            return 1
+        except json.JSONDecodeError as e:
+            print("Invalid JSON spec: %s" % e)
+            return 1
+        out = args.output or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "reports", "frida")
+        script_path, info_path = print_generated(script, info, out)
+        print("Wrote %s" % script_path)
+        print("Wrote %s" % info_path)
+        if args.validate or True:
+            ok, err = validate_js(script)
+            print("JS structural validation: %s"
+                  % ("OK" if ok else "FAIL: " + str(err)))
+            if not ok:
+                return 1
+        return 0
 
-
-class FridaGenerator:
-    """Main Frida script generator orchestrator."""
-
-    def __init__(self, output_dir: str = "frida_output"):
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        self.scripts: List[FridaScript] = []
-
-    def create_ssl_bypass_script(self) -> FridaScript:
-        script = FridaScript("ssl_bypass", "SSL pinning bypass for Android apps")
-        script.add_hook(
-            "com.android.org.conscrypt.TrustManagerImpl",
-            "verifyChain",
-            "return untrustedChain;",
-        )
-        script.add_hook(
-            "android.webkit.WebViewClient",
-            "onReceivedSslError",
-            "handler.proceed();",
-        )
-        self.scripts.append(script)
-        return script
-
-    def create_root_bypass_script(self) -> FridaScript:
-        script = FridaScript("root_bypass", "Root detection bypass")
-        script.add_hook(
-            "java.io.File",
-            "exists",
-            "var path = this.getAbsolutePath(); if (path.indexOf('su') !== -1) { return false; } return this.exists();",
-        )
-        self.scripts.append(script)
-        return script
-
-    def create_class_enum_script(self, pattern: str = ".*") -> FridaScript:
-        script = FridaScript("class_enum", f"Enumerate classes matching: {pattern}")
-        script.add_enumeration("loaded_classes", pattern)
-        self.scripts.append(script)
-        return script
-
-    def create_custom_script(self, name: str) -> FridaScript:
-        script = FridaScript(name, f"Custom script: {name}")
-        self.scripts.append(script)
-        return script
-
-    def build_composite(self, name: str, components: List[str]) -> str:
-        builder = ScriptBuilder(name)
-        for component in components:
-            if component == "ssl":
-                builder.add_ssl_bypass()
-            elif component == "root":
-                builder.add_root_bypass()
-            elif component.startswith("enum:"):
-                pattern = component.split(":", 1)[1]
-                builder.add_class_enum(pattern)
-        return builder.build()
-
-    def save_all(self) -> List[str]:
-        saved = []
-        for i, script in enumerate(self.scripts):
-            js_path = os.path.join(self.output_dir, f"{script.name}.js")
-            json_path = os.path.join(self.output_dir, f"{script.name}.json")
-            if script.save(js_path):
-                saved.append(js_path)
-            if script.save_json(json_path):
-                saved.append(json_path)
-        return saved
-
-    def list_saved(self) -> List[str]:
-        if not os.path.exists(self.output_dir):
-            return []
-        return [
-            os.path.join(self.output_dir, f)
-            for f in os.listdir(self.output_dir)
-            if f.endswith((".js", ".json"))
-        ]
-
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: frida_gen.py <command> [args]")
-        print("Commands:")
-        print("  ssl-bypass        - Generate SSL bypass script")
-        print("  root-bypass       - Generate root detection bypass script")
-        print("  class-enum <pat>  - Generate class enumeration script")
-        print("  composite <name>  - Generate composite script (interactive)")
-        print("  hook <class> <method> - Generate hook for specific method")
-        print("  list              - List saved scripts")
-        return
-
-    cmd = sys.argv[1]
-    gen = FridaGenerator()
-
-    if cmd == "ssl-bypass":
-        script = gen.create_ssl_bypass_script()
-        saved = gen.save_all()
-        print(f"Saved: {saved}")
-
-    elif cmd == "root-bypass":
-        script = gen.create_root_bypass_script()
-        saved = gen.save_all()
-        print(f"Saved: {saved}")
-
-    elif cmd == "class-enum":
-        pattern = sys.argv[2] if len(sys.argv) > 2 else ".*"
-        script = gen.create_class_enum_script(pattern)
-        saved = gen.save_all()
-        print(f"Saved: {saved}")
-
-    elif cmd == "composite":
-        name = sys.argv[2] if len(sys.argv) > 2 else "composite"
-        builder = ScriptBuilder(name)
-        builder.add_ssl_bypass()
-        builder.add_root_bypass()
-        output = os.path.join(gen.output_dir, f"{name}.js")
-        builder.save(output)
-        print(f"Saved: {output}")
-
-    elif cmd == "hook":
-        if len(sys.argv) < 4:
-            print("Usage: frida_gen.py hook <class_name> <method_name>")
-            return
-        js = HookGenerator.generate_return_value_hook(sys.argv[2], sys.argv[3])
-        output = os.path.join(gen.output_dir, "hook.js")
-        with open(output, "w") as f:
-            f.write(js)
-        print(f"Saved: {output}")
-
-    elif cmd == "list":
-        scripts = gen.list_saved()
-        for s in scripts:
-            print(s)
-
-    else:
-        print(f"Unknown command: {cmd}")
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

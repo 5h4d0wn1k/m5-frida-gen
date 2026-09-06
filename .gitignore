@@ -1,4 +1,7 @@
+reports/
+sandbox/
 __pycache__/
 *.pyc
 *.pyo
 frida_output/
+.DS_Store
